@@ -17,81 +17,6 @@ struct Results {
     results: Vec<Value>,
 }
 
-fn run_query(account_id: &str, api_key: &str, query: &str) -> String {
-    let encoded_nrql: String = byte_serialize(query.as_bytes()).collect();
-    let client = reqwest::Client::new();
-    let url = format!(
-        "https://insights-api.newrelic.com/v1/accounts/{}/query?nrql={}",
-        account_id, encoded_nrql
-    );
-    println!("{}", query);
-    let mut body = client
-        .get(url.as_str())
-        .header("Accept", "application/json")
-        .header("X-Query-Key", api_key)
-        .send()
-        .unwrap();
-    body.text().unwrap()
-}
-
-fn print_results_as_json(results: &str) {
-    print!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::from_str::<Value>(results).unwrap()).unwrap()
-    );
-}
-
-fn print_results(results: &str) {
-    let parsed = serde_json::from_str::<Results>(results).unwrap();
-    // Results are an object with a key of events or eventTypes.
-    // Pull the value of whatever is there.
-    let props = &parsed.results[0].as_object().unwrap();
-    let value = props[props.keys().next().unwrap()].as_array().unwrap();
-    let mut first: bool = true;
-    // Note: This does not properly handle unicode characters!
-    let mut widths = Vec::<usize>::new();
-    let mut rows = Vec::<Vec<String>>::new();
-    for v in value {
-        match v {
-            Value::String(string_value) => println!("{}", string_value),
-            Value::Object(obj_value) => {
-                if first {
-                    let mut row = Vec::<String>::new();
-                    for key in obj_value.keys() {
-                        widths.push(key.len());
-                        row.push(key.to_owned());
-                    }
-                    first = false;
-                    rows.push(row);
-                }
-                let row = obj_value
-                    .keys()
-                    .map(|k| {
-                        obj_value[k]
-                            .to_string()
-                            .trim_matches::<&[char]>(&['"'])
-                            .to_owned()
-                    })
-                    .collect::<Vec<String>>();
-                widths = row
-                    .iter()
-                    .map(|c| c.len())
-                    .zip(widths)
-                    .map(|(cw, mw)| max(cw, mw))
-                    .collect();
-                rows.push(row);
-            }
-            _ => println!("Unexpected type in result!"),
-        }
-    }
-    for row in rows {
-        for (column, width) in row.iter().zip(&widths) {
-            print!("{:<width$} ", column, width = width);
-        }
-        println!("");
-    }
-}
-
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct Account {
     account_id: String,
@@ -105,46 +30,153 @@ struct Config {
     accounts: Option<HashMap<String, Account>>,
 }
 
-fn get_id_and_key(matches: &ArgMatches) -> (String, String) {
-    let account_id = matches.value_of("account_id");
-    let api_key = matches.value_of("api_key");
-    if account_id == None || api_key == None {
-        if account_id != None || api_key != None {
-            panic!("Either pass in both account_id and api_key or pull in both from the config.");
+struct Connection {
+    account_id: String,
+    api_key: String,
+    url: String,
+}
+
+struct QueryResults {
+    raw: String,
+}
+
+impl Connection {
+    fn from_args(matches: &ArgMatches) -> Connection {
+        let default_url = "https://insights-api.newrelic.com/".to_string();
+        let account_id = matches.value_of("account_id");
+        let api_key = matches.value_of("api_key");
+        let url = matches.value_of("url");
+        if account_id == None || api_key == None {
+            if account_id != None || api_key != None {
+                panic!(
+                    "Either pass in both account_id and api_key or pull in both from the config."
+                );
+            }
+            let home_dir = dirs::home_dir();
+            if home_dir == None {
+                panic!(
+                    "Unable to find home directory for config. Must provide account_id and api_key!"
+                );
+            }
+            let home_dir = home_dir.unwrap();
+            let config_path = format!("{}/.insights.yaml", home_dir.display());
+            if !Path::new(config_path.as_str()).exists() {
+                panic!(format!(
+                    "{} does not exist. Must provide account_id and api_key!",
+                    config_path
+                ));
+            }
+            let file = File::open(config_path).unwrap();
+            let config: Config = serde_yaml::from_reader(file).unwrap();
+            let account = matches
+                .value_of("account")
+                .or(config.default.as_ref().map(Deref::deref));
+            if account == None {
+                panic!("No account specified!");
+            }
+            let account = account.unwrap();
+            let accounts = &(config.accounts).unwrap();
+            let account_config = accounts.get(account).unwrap_or_else(|| {
+                panic!(format!("Unable to find account config for {}!", &account))
+            });
+            let url = account_config
+                .url
+                .as_ref()
+                .unwrap_or(&default_url.to_owned())
+                .to_string();
+            return Connection {
+                account_id: account_config.account_id.to_string(),
+                api_key: account_config.api_key.to_string(),
+                url: url.to_string(),
+            };
         }
-        let home_dir = dirs::home_dir();
-        if home_dir == None {
-            panic!(
-                "Unable to find home directory for config. Must provide account_id and api_key!"
-            );
+
+        Connection {
+            account_id: account_id.unwrap().to_owned(),
+            api_key: api_key.unwrap().to_owned(),
+            url: url.unwrap_or(default_url.as_str()).to_string(),
         }
-        let home_dir = home_dir.unwrap();
-        let config_path = format!("{}/.insights.yaml", home_dir.display());
-        if !Path::new(config_path.as_str()).exists() {
-            panic!(format!(
-                "{} does not exist. Must provide account_id and api_key!",
-                config_path
-            ));
+    }
+
+    fn run_query(&self, query: &str) -> QueryResults {
+        let encoded_nrql: String = byte_serialize(query.as_bytes()).collect();
+        let client = reqwest::Client::new();
+        let url = format!(
+            "{}v1/accounts/{}/query?nrql={}",
+            &self.url, &self.account_id, encoded_nrql
+        );
+        println!("{}", query);
+        let mut body = client
+            .get(url.as_str())
+            .header("Accept", "application/json")
+            .header("X-Query-Key", &self.api_key)
+            .send()
+            .unwrap();
+        QueryResults {
+            raw: body.text().unwrap(),
         }
-        let file = File::open(config_path).unwrap();
-        let config: Config = serde_yaml::from_reader(file).unwrap();
-        let account = matches
-            .value_of("account")
-            .or(config.default.as_ref().map(Deref::deref));
-        if account == None {
-            panic!("No account specified!");
-        }
-        let account = account.unwrap();
-        let accounts = &(config.accounts).unwrap();
-        let account_config = accounts
-            .get(account)
-            .unwrap_or_else(|| panic!(format!("Unable to find account config for {}!", &account)));
-        return (
-            account_config.account_id.to_string(),
-            account_config.api_key.to_string(),
+    }
+}
+
+impl QueryResults {
+    fn print_json(&self) {
+        print!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::from_str::<Value>(&self.raw).unwrap())
+                .unwrap()
         );
     }
-    return (account_id.unwrap().to_owned(), api_key.unwrap().to_owned());
+
+    fn print(&self) {
+        let parsed = serde_json::from_str::<Results>(&self.raw).unwrap();
+        // Results are an object with a key of events or eventTypes.
+        // Pull the value of whatever is there.
+        let props = &parsed.results[0].as_object().unwrap();
+        let value = props[props.keys().next().unwrap()].as_array().unwrap();
+        let mut first: bool = true;
+        // Note: This does not properly handle unicode characters!
+        let mut widths = Vec::<usize>::new();
+        let mut rows = Vec::<Vec<String>>::new();
+        for v in value {
+            match v {
+                Value::String(string_value) => println!("{}", string_value),
+                Value::Object(obj_value) => {
+                    if first {
+                        let mut row = Vec::<String>::new();
+                        for key in obj_value.keys() {
+                            widths.push(key.len());
+                            row.push(key.to_owned());
+                        }
+                        first = false;
+                        rows.push(row);
+                    }
+                    let row = obj_value
+                        .keys()
+                        .map(|k| {
+                            obj_value[k]
+                                .to_string()
+                                .trim_matches::<&[char]>(&['"'])
+                                .to_owned()
+                        })
+                        .collect::<Vec<String>>();
+                    widths = row
+                        .iter()
+                        .map(|c| c.len())
+                        .zip(widths)
+                        .map(|(cw, mw)| max(cw, mw))
+                        .collect();
+                    rows.push(row);
+                }
+                _ => println!("Unexpected type in result!"),
+            }
+        }
+        for row in rows {
+            for (column, width) in row.iter().zip(&widths) {
+                print!("{:<width$} ", column, width = width);
+            }
+            println!("");
+        }
+    }
 }
 
 fn main() {
@@ -214,31 +246,28 @@ fn main() {
                 .arg(Arg::with_name("partial").help("The partial text to complete")),
         )
         .get_matches();
-    let (account_id, api_key) = get_id_and_key(&matches);
+    let connection = Connection::from_args(&matches);
     if let Some(run) = matches.subcommand_matches("run") {
         let nrql = run.value_of("nrql").unwrap();
-        let results = run_query(&account_id, &api_key, nrql);
+        let results = connection.run_query(nrql);
         match matches.value_of("json") {
-            Some(_) => print_results_as_json(results.as_str()),
-            None => print_results(results.as_str()),
+            Some(_) => results.print_json(),
+            None => results.print(),
         }
     }
     if let Some(_types) = matches.subcommand_matches("types") {
-        print_results(run_query(&account_id, &api_key, "show event types").as_str());
+        connection.run_query("show event types").print();
     }
     if let Some(attrs) = matches.subcommand_matches("attrs") {
-        print_results(
-            run_query(
-                &account_id,
-                &api_key,
+        connection
+            .run_query(
                 format!(
                     "select keyset() from {} since 1 week ago",
                     attrs.value_of("type").unwrap()
                 )
                 .as_str(),
             )
-            .as_str(),
-        );
+            .print();
     }
     if let Some(complete) = matches.subcommand_matches("complete") {
         let table = complete.value_of("type").unwrap();
@@ -249,6 +278,6 @@ fn main() {
         }
         query.push_str(" since 1 week ago");
 
-        print_results(&run_query(&account_id, &api_key, query.as_str()));
+        connection.run_query(query.as_str()).print();
     }
 }
