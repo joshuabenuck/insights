@@ -14,4 +14,5 @@ dirs = "*"
 serde = "*"
 serde_json = "*"
 serde_yaml = "*"
-
+failure = "*"
+failure_derive = "*"

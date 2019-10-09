@@ -1,6 +1,9 @@
 // Copyright 2019 - Joshua Benuck
 // Licensed under the MIT license
 use clap::{App, AppSettings, Arg, ArgMatches, SubCommand};
+extern crate failure;
+extern crate failure_derive;
+use failure::{err_msg, Error, Fail};
 use reqwest;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -11,6 +14,12 @@ use std::fs::File;
 use std::ops::Deref;
 use std::path::Path;
 use url::form_urlencoded::byte_serialize;
+
+#[derive(Fail, Debug)]
+enum InsightsError {
+    #[fail(display = "An error occurred.")]
+    HomeDirNotFound,
+}
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct Results {
@@ -41,64 +50,58 @@ struct QueryResults {
 }
 
 impl Connection {
-    fn from_args(matches: &ArgMatches) -> Connection {
+    fn from_args(matches: &ArgMatches) -> Result<Connection, Error> {
         let default_url = "https://insights-api.newrelic.com/".to_string();
         let account_id = matches.value_of("account_id");
         let api_key = matches.value_of("api_key");
         let url = matches.value_of("url");
         if account_id == None || api_key == None {
             if account_id != None || api_key != None {
-                panic!(
-                    "Either pass in both account_id and api_key or pull in both from the config."
-                );
-            }
-            let home_dir = dirs::home_dir();
-            if home_dir == None {
-                panic!(
-                    "Unable to find home directory for config. Must provide account_id and api_key!"
-                );
-            }
-            let home_dir = home_dir.unwrap();
-            let config_path = format!("{}/.insights.yaml", home_dir.display());
-            if !Path::new(config_path.as_str()).exists() {
-                panic!(format!(
-                    "{} does not exist. Must provide account_id and api_key!",
-                    config_path
+                return Err(err_msg(
+                    "Either pass in both account_id and api_key or pull in both from the config.",
                 ));
             }
-            let file = File::open(config_path).unwrap();
-            let config: Config = serde_yaml::from_reader(file).unwrap();
+            let home_dir = dirs::home_dir().ok_or(err_msg(
+                "Unable to find home directory for config. Must provide account_id and api_key!",
+            ))?;
+            let config_path = format!("{}/.insights.yaml", home_dir.display());
+            if !Path::new(config_path.as_str()).exists() {
+                return Err(err_msg(format!(
+                    "{} does not exist. Must provide account_id and api_key!",
+                    config_path
+                )));
+            }
+            let file = File::open(config_path)?;
+            let config: Config = serde_yaml::from_reader(file)?;
             let account = matches
                 .value_of("account")
-                .or(config.default.as_ref().map(Deref::deref));
-            if account == None {
-                panic!("No account specified!");
-            }
-            let account = account.unwrap();
+                .or(config.default.as_ref().map(Deref::deref))
+                .ok_or(err_msg("No account specified!"))?;
             let accounts = &(config.accounts).unwrap();
-            let account_config = accounts.get(account).unwrap_or_else(|| {
-                panic!(format!("Unable to find account config for {}!", &account))
-            });
+            let account_config = accounts.get(account).ok_or(err_msg(format!(
+                "Unable to find account config for {}!",
+                &account
+            )))?;
             let url = account_config
                 .url
                 .as_ref()
                 .unwrap_or(&default_url.to_owned())
                 .to_string();
-            return Connection {
+            return Ok(Connection {
                 account_id: account_config.account_id.to_string(),
                 api_key: account_config.api_key.to_string(),
                 url: url.to_string(),
-            };
+            });
         }
 
-        Connection {
+        Ok(Connection {
             account_id: account_id.unwrap().to_owned(),
             api_key: api_key.unwrap().to_owned(),
             url: url.unwrap_or(default_url.as_str()).to_string(),
-        }
+        })
     }
 
-    fn run_query(&self, query: &str) -> QueryResults {
+    fn run_query(&self, query: &str) -> Result<QueryResults, Error> {
         let encoded_nrql: String = byte_serialize(query.as_bytes()).collect();
         let client = reqwest::Client::new();
         let url = format!(
@@ -110,11 +113,8 @@ impl Connection {
             .get(url.as_str())
             .header("Accept", "application/json")
             .header("X-Query-Key", &self.api_key)
-            .send()
-            .unwrap();
-        QueryResults {
-            raw: body.text().unwrap(),
-        }
+            .send()?;
+        Ok(QueryResults { raw: body.text()? })
     }
 }
 
@@ -177,6 +177,44 @@ impl QueryResults {
             println!("");
         }
     }
+}
+
+fn process_matches(matches: ArgMatches) -> Result<(), Error> {
+    let connection = Connection::from_args(&matches)?;
+    if let Some(run) = matches.subcommand_matches("run") {
+        let nrql = run.value_of("nrql").unwrap();
+        let results = connection.run_query(nrql)?;
+        match matches.value_of("json") {
+            Some(_) => results.print_json(),
+            None => results.print(),
+        }
+    }
+    if let Some(_types) = matches.subcommand_matches("types") {
+        connection.run_query("show event types")?.print();
+    }
+    if let Some(attrs) = matches.subcommand_matches("attrs") {
+        connection
+            .run_query(
+                format!(
+                    "select keyset() from {} since 1 week ago",
+                    attrs.value_of("type").unwrap()
+                )
+                .as_str(),
+            )?
+            .print();
+    }
+    if let Some(complete) = matches.subcommand_matches("complete") {
+        let table = complete.value_of("type").unwrap();
+        let column = complete.value_of("attr").unwrap();
+        let mut query = format!("select uniques({}) from {}", column, table);
+        if let Some(partial) = complete.value_of("partial") {
+            query.push_str(format!(" where {} like '{}%'", column, partial).as_str());
+        }
+        query.push_str(" since 1 week ago");
+
+        connection.run_query(query.as_str())?.print();
+    }
+    Ok(())
 }
 
 fn main() {
@@ -246,38 +284,11 @@ fn main() {
                 .arg(Arg::with_name("partial").help("The partial text to complete")),
         )
         .get_matches();
-    let connection = Connection::from_args(&matches);
-    if let Some(run) = matches.subcommand_matches("run") {
-        let nrql = run.value_of("nrql").unwrap();
-        let results = connection.run_query(nrql);
-        match matches.value_of("json") {
-            Some(_) => results.print_json(),
-            None => results.print(),
+    match process_matches(matches) {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1)
         }
-    }
-    if let Some(_types) = matches.subcommand_matches("types") {
-        connection.run_query("show event types").print();
-    }
-    if let Some(attrs) = matches.subcommand_matches("attrs") {
-        connection
-            .run_query(
-                format!(
-                    "select keyset() from {} since 1 week ago",
-                    attrs.value_of("type").unwrap()
-                )
-                .as_str(),
-            )
-            .print();
-    }
-    if let Some(complete) = matches.subcommand_matches("complete") {
-        let table = complete.value_of("type").unwrap();
-        let column = complete.value_of("attr").unwrap();
-        let mut query = format!("select uniques({}) from {}", column, table);
-        if let Some(partial) = complete.value_of("partial") {
-            query.push_str(format!(" where {} like '{}%'", column, partial).as_str());
-        }
-        query.push_str(" since 1 week ago");
-
-        connection.run_query(query.as_str()).print();
     }
 }
