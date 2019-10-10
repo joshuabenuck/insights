@@ -39,14 +39,14 @@ struct Config {
     accounts: Option<HashMap<String, Account>>,
 }
 
+struct QueryResults {
+    raw: String,
+}
+
 struct Connection {
     account_id: String,
     api_key: String,
     url: String,
-}
-
-struct QueryResults {
-    raw: String,
 }
 
 impl Connection {
@@ -118,16 +118,62 @@ impl Connection {
     }
 }
 
+#[derive(Debug)]
+enum Format {
+    Raw,
+    JSON,
+    CSV,
+    Table,
+}
+
+impl Format {
+    fn from_args(matches: &ArgMatches) -> Format {
+        if matches.is_present("json") {
+            return Format::JSON;
+        }
+        if matches.is_present("csv") {
+            return Format::CSV;
+        }
+        if matches.is_present("raw") {
+            return Format::Raw;
+        }
+        if matches.is_present("table") {
+            return Format::Table;
+        }
+        return Format::Table;
+    }
+}
+
 impl QueryResults {
-    fn print_json(&self) {
+    fn print(&self, format: Format) -> Result<(), Error> {
+        match format {
+            Format::Table => self.print_table(),
+            Format::JSON => self.print_json(),
+            Format::Raw => self.print_raw(),
+            Format::CSV => Err(err_msg("Unimplemented Output Format: CSV")),
+        }
+    }
+
+    fn print_raw(&self) -> Result<(), Error> {
         print!(
             "{}",
             serde_json::to_string_pretty(&serde_json::from_str::<Value>(&self.raw).unwrap())
                 .unwrap()
         );
+        Ok(())
     }
 
-    fn print(&self) {
+    fn print_json(&self) -> Result<(), Error> {
+        let parsed = serde_json::from_str::<Results>(&self.raw).unwrap();
+        // Results are an object with a key of events or eventTypes.
+        // Pull the value of whatever is there.
+        let props = &parsed.results[0].as_object().unwrap();
+        let value = props[props.keys().next().unwrap()].as_array().unwrap();
+        println!("{}", serde_json::to_string_pretty(value)?);
+        Ok(())
+    }
+
+    fn print_table(&self) -> Result<(), Error> {
         let parsed = serde_json::from_str::<Results>(&self.raw).unwrap();
         // Results are an object with a key of events or eventTypes.
         // Pull the value of whatever is there.
@@ -176,6 +222,7 @@ impl QueryResults {
             }
             println!("");
         }
+        Ok(())
     }
 }
 
@@ -183,14 +230,12 @@ fn process_matches(matches: ArgMatches) -> Result<(), Error> {
     let connection = Connection::from_args(&matches)?;
     if let Some(run) = matches.subcommand_matches("run") {
         let nrql = run.value_of("nrql").unwrap();
-        let results = connection.run_query(nrql)?;
-        match matches.value_of("json") {
-            Some(_) => results.print_json(),
-            None => results.print(),
-        }
+        connection.run_query(nrql)?.print(Format::from_args(&run))?;
     }
-    if let Some(_types) = matches.subcommand_matches("types") {
-        connection.run_query("show event types")?.print();
+    if let Some(types) = matches.subcommand_matches("types") {
+        connection
+            .run_query("show event types")?
+            .print(Format::from_args(&types))?;
     }
     if let Some(attrs) = matches.subcommand_matches("attrs") {
         connection
@@ -201,7 +246,7 @@ fn process_matches(matches: ArgMatches) -> Result<(), Error> {
                 )
                 .as_str(),
             )?
-            .print();
+            .print(Format::from_args(&attrs))?;
     }
     if let Some(complete) = matches.subcommand_matches("complete") {
         let table = complete.value_of("type").unwrap();
@@ -212,9 +257,40 @@ fn process_matches(matches: ArgMatches) -> Result<(), Error> {
         }
         query.push_str(" since 1 week ago");
 
-        connection.run_query(query.as_str())?.print();
+        connection
+            .run_query(query.as_str())?
+            .print(Format::from_args(&complete))?;
     }
     Ok(())
+}
+
+trait FormattingFlags {
+    fn add_formatting_flags(self) -> Self;
+}
+
+impl FormattingFlags for App<'_, '_> {
+    fn add_formatting_flags(self) -> Self {
+        self.arg(
+            Arg::with_name("raw")
+                .long("raw")
+                .help("Return raw query output"),
+        )
+        .arg(
+            Arg::with_name("json")
+                .long("json")
+                .help("Format output as json"),
+        )
+        .arg(
+            Arg::with_name("csv")
+                .long("csv")
+                .help("Format output as CSV"),
+        )
+        .arg(
+            Arg::with_name("table")
+                .long("table")
+                .help("Format output as table (default)"),
+        )
+    }
 }
 
 fn main() {
@@ -247,17 +323,13 @@ fn main() {
         .subcommand(
             SubCommand::with_name("run")
                 .about("Run an Insights query")
-                .arg(
-                    Arg::with_name("json")
-                        .long("json")
-                        .short("j")
-                        .help("Print query results as json"),
-                )
-                .arg(Arg::with_name("nrql").help("The NRQL to run")),
+                .arg(Arg::with_name("nrql").help("The NRQL to run"))
+                .add_formatting_flags(),
         )
         .subcommand(
             SubCommand::with_name("types")
-                .about("Returns the list of known types for the account."),
+                .about("Returns the list of known types for the account.")
+                .add_formatting_flags(),
         )
         .subcommand(
             SubCommand::with_name("attrs")
@@ -266,7 +338,8 @@ fn main() {
                     Arg::with_name("type")
                         .required(true)
                         .help("The type for which to display attributes"),
-                ),
+                )
+                .add_formatting_flags(),
         )
         .subcommand(
             SubCommand::with_name("complete")
@@ -281,7 +354,8 @@ fn main() {
                         .required(true)
                         .help("The attribute to complete"),
                 )
-                .arg(Arg::with_name("partial").help("The partial text to complete")),
+                .arg(Arg::with_name("partial").help("The partial text to complete"))
+                .add_formatting_flags(),
         )
         .get_matches();
     match process_matches(matches) {
